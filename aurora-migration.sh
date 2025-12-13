@@ -39,17 +39,24 @@ echo
 
 # Step 1: Configure Source Account
 echo -e "${BLUE}Step 1: Source Account Credentials${NC}"
-read -p "Source AWS Access Key: " SOURCE_ACCESS_KEY
-read -s -p "Source AWS Secret Key: " SOURCE_SECRET_KEY
-echo
-read -p "Source Region [us-east-1]: " SOURCE_REGION
-SOURCE_REGION=${SOURCE_REGION:-us-east-1}
-
-configure_aws_profile "source-account" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" "$SOURCE_REGION"
-
-# Get source account ID
-SOURCE_ACCOUNT_ID=$(aws sts get-caller-identity --profile source-account --query Account --output text)
-echo -e "${GREEN}✓ Source Account: $SOURCE_ACCOUNT_ID${NC}"
+while true; do
+    read -p "Source AWS Access Key: " SOURCE_ACCESS_KEY
+    read -s -p "Source AWS Secret Key: " SOURCE_SECRET_KEY
+    echo
+    read -p "Source Region [us-east-1]: " SOURCE_REGION
+    SOURCE_REGION=${SOURCE_REGION:-us-east-1}
+    
+    configure_aws_profile "source-account" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" "$SOURCE_REGION"
+    
+    # Validate credentials
+    if SOURCE_ACCOUNT_ID=$(aws sts get-caller-identity --profile source-account --query Account --output text 2>/dev/null); then
+        echo -e "${GREEN}✓ Source Account: $SOURCE_ACCOUNT_ID${NC}"
+        break
+    else
+        echo -e "${RED}✗ Invalid credentials. Please try again.${NC}"
+        echo
+    fi
+done
 echo
 
 # Step 2: List and Select Source Cluster
@@ -98,16 +105,24 @@ echo
 
 # Step 3: Configure Target Account
 echo -e "${BLUE}Step 3: Target Account Credentials${NC}"
-read -p "Target AWS Access Key: " TARGET_ACCESS_KEY
-read -s -p "Target AWS Secret Key: " TARGET_SECRET_KEY
-echo
-read -p "Target Region [$SOURCE_REGION]: " TARGET_REGION
-TARGET_REGION=${TARGET_REGION:-$SOURCE_REGION}
-
-configure_aws_profile "target-account" "$TARGET_ACCESS_KEY" "$TARGET_SECRET_KEY" "$TARGET_REGION"
-
-TARGET_ACCOUNT_ID=$(aws sts get-caller-identity --profile target-account --query Account --output text)
-echo -e "${GREEN}✓ Target Account: $TARGET_ACCOUNT_ID${NC}"
+while true; do
+    read -p "Target AWS Access Key: " TARGET_ACCESS_KEY
+    read -s -p "Target AWS Secret Key: " TARGET_SECRET_KEY
+    echo
+    read -p "Target Region [$SOURCE_REGION]: " TARGET_REGION
+    TARGET_REGION=${TARGET_REGION:-$SOURCE_REGION}
+    
+    configure_aws_profile "target-account" "$TARGET_ACCESS_KEY" "$TARGET_SECRET_KEY" "$TARGET_REGION"
+    
+    # Validate credentials
+    if TARGET_ACCOUNT_ID=$(aws sts get-caller-identity --profile target-account --query Account --output text 2>/dev/null); then
+        echo -e "${GREEN}✓ Target Account: $TARGET_ACCOUNT_ID${NC}"
+        break
+    else
+        echo -e "${RED}✗ Invalid credentials. Please try again.${NC}"
+        echo
+    fi
+done
 echo
 
 # Step 4: Select Target VPC
@@ -254,11 +269,23 @@ echo
 
 # Step 7: Migration Configuration
 echo -e "${BLUE}Step 7: Migration Configuration${NC}"
+
+# Get source instance count
+SOURCE_INSTANCE_INFO=$(aws rds describe-db-instances \
+    --profile source-account \
+    --region $SOURCE_REGION \
+    --query "DBInstances[?DBClusterIdentifier=='$SOURCE_CLUSTER_ID'].[DBInstanceIdentifier,DBInstanceClass]" \
+    --output text)
+
+SOURCE_INSTANCE_COUNT=$(echo "$SOURCE_INSTANCE_INFO" | wc -l | xargs)
+echo "Source cluster has $SOURCE_INSTANCE_COUNT instance(s):"
+while IFS=$'\t' read -r id class; do
+    echo "  - $id ($class)"
+done <<< "$SOURCE_INSTANCE_INFO"
+echo
+
 read -p "Target Cluster Name [restored-$SOURCE_CLUSTER_ID]: " TARGET_CLUSTER_ID
 TARGET_CLUSTER_ID=${TARGET_CLUSTER_ID:-restored-$SOURCE_CLUSTER_ID}
-
-read -p "Target Instance Class [db.r5.large]: " TARGET_INSTANCE_CLASS
-TARGET_INSTANCE_CLASS=${TARGET_INSTANCE_CLASS:-db.r5.large}
 
 SNAPSHOT_ID="aurora-migration-$(date +%Y%m%d-%H%M%S)"
 TEMP_SNAPSHOT_ID="${SNAPSHOT_ID}-temp"
@@ -271,7 +298,7 @@ echo "Target: $TARGET_CLUSTER_ID ($TARGET_ACCOUNT_ID)"
 echo "VPC: $TARGET_VPC_ID"
 echo "Subnet Group: $TARGET_SUBNET_GROUP"
 echo "Security Groups: $SELECTED_SGS"
-echo "Instance Class: $TARGET_INSTANCE_CLASS"
+echo "Instances to migrate: $SOURCE_INSTANCE_COUNT"
 echo "─────────────────────────────────────────────────"
 echo
 read -p "Proceed with migration? (yes/no): " CONFIRM
@@ -508,41 +535,71 @@ done
 
 echo -e "${GREEN}✓ Cluster restored${NC}"
 
-# Create instance
-echo "Creating DB instance..."
-aws rds create-db-instance \
-    --db-instance-identifier "${TARGET_CLUSTER_ID}-instance-1" \
-    --db-cluster-identifier $TARGET_CLUSTER_ID \
-    --db-instance-class $TARGET_INSTANCE_CLASS \
-    --engine aurora-postgresql \
-    --profile target-account \
-    --region $TARGET_REGION > /dev/null
+# Get source cluster instances
+echo "Detecting source cluster instances..."
+SOURCE_INSTANCES=$(aws rds describe-db-instances \
+    --profile source-account \
+    --region $SOURCE_REGION \
+    --query "DBInstances[?DBClusterIdentifier=='$SOURCE_CLUSTER_ID'].[DBInstanceIdentifier,DBInstanceClass,Engine]" \
+    --output text)
 
-echo "Waiting for instance to be available..."
-while true; do
-    STATUS=$(aws rds describe-db-instances \
-        --db-instance-identifier "${TARGET_CLUSTER_ID}-instance-1" \
+INSTANCE_COUNT=$(echo "$SOURCE_INSTANCES" | wc -l | xargs)
+echo "Found $INSTANCE_COUNT instance(s) in source cluster"
+echo
+
+# Create instances
+INSTANCE_NUM=1
+while IFS=$'\t' read -r instance_id instance_class engine; do
+    TARGET_INSTANCE_ID="${TARGET_CLUSTER_ID}-instance-${INSTANCE_NUM}"
+    
+    echo "Creating instance $INSTANCE_NUM: $TARGET_INSTANCE_ID (class: $instance_class)..."
+    
+    aws rds create-db-instance \
+        --db-instance-identifier "$TARGET_INSTANCE_ID" \
+        --db-cluster-identifier $TARGET_CLUSTER_ID \
+        --db-instance-class "$instance_class" \
+        --engine aurora-postgresql \
         --profile target-account \
-        --region $TARGET_REGION \
-        --query 'DBInstances[0].DBInstanceStatus' \
-        --output text 2>/dev/null || echo "creating")
+        --region $TARGET_REGION > /dev/null
     
-    if [ "$STATUS" = "available" ]; then
-        break
-    fi
-    
-    echo "  Status: $STATUS..."
-    sleep 30
-done
+    ((INSTANCE_NUM++))
+done <<< "$SOURCE_INSTANCES"
 
-echo -e "${GREEN}✓ Instance created${NC}"
+echo
+echo "Waiting for all instances to be available..."
+INSTANCE_NUM=1
+while [ $INSTANCE_NUM -lt $((INSTANCE_COUNT + 1)) ]; do
+    TARGET_INSTANCE_ID="${TARGET_CLUSTER_ID}-instance-${INSTANCE_NUM}"
+    
+    while true; do
+        STATUS=$(aws rds describe-db-instances \
+            --db-instance-identifier "$TARGET_INSTANCE_ID" \
+            --profile target-account \
+            --region $TARGET_REGION \
+            --query 'DBInstances[0].DBInstanceStatus' \
+            --output text 2>/dev/null || echo "creating")
+        
+        if [ "$STATUS" = "available" ]; then
+            echo -e "${GREEN}✓ Instance $INSTANCE_NUM available${NC}"
+            break
+        fi
+        
+        echo "  Instance $INSTANCE_NUM status: $STATUS..."
+        sleep 30
+    done
+    
+    ((INSTANCE_NUM++))
+done
 echo
 echo -e "${GREEN}╔════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║         Migration Completed Successfully!     ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════════════╝${NC}"
 echo
 echo "Target Cluster: $TARGET_CLUSTER_ID"
-echo "Target Instance: ${TARGET_CLUSTER_ID}-instance-1"
+echo "Target Instances:"
+for ((i=1; i<=$INSTANCE_COUNT; i++)); do
+    echo "  - ${TARGET_CLUSTER_ID}-instance-$i"
+done
 echo
 echo -e "${YELLOW}IMPORTANT: Rotate the AWS credentials used in this migration${NC}"
 echo
